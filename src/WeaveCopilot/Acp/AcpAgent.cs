@@ -249,6 +249,7 @@ public sealed class AcpAgent(JsonRpcConnection rpc, ICopilotHost host, bool hydr
         {
             case Update u: rpc.SendNotification("session/update", new JsonObject { ["sessionId"] = sessionId, ["update"] = u.Body }); break;
             case Fusion f: f.Params["sessionId"] = sessionId; rpc.SendNotification("_fleet/fusion", f.Params); break;
+            case ModelChosen m: rpc.SendNotification("_fleet/model", new JsonObject { ["sessionId"] = sessionId, ["model"] = m.Model }); break;
             case ShellCommand c: c.Params["sessionId"] = sessionId; rpc.SendNotification("_fleet/shell_command", c.Params); break;
             case Work w: w.Params["sessionId"] = sessionId; rpc.SendNotification("_fleet/work", w.Params); break;
             case Compaction c: c.Params["sessionId"] = sessionId; rpc.SendNotification("_fleet/compaction", c.Params); break;
@@ -312,6 +313,7 @@ public sealed class AcpAgent(JsonRpcConnection rpc, ICopilotHost host, bool hydr
             var end = await turn.Task;
             if (end is Failure f) throw new JsonRpcException(-32000, f.Message);
             var idle = (Idle)end;
+            if (!idle.Aborted && !s.CancelRequested) await s.Session.VerifyModelSelectionAsync();
             var result = new JsonObject { ["stopReason"] = idle.Aborted || s.CancelRequested ? "cancelled" : "end_turn" };
             if (idle.Usage is not null) result["usage"] = idle.Usage;
             return result;

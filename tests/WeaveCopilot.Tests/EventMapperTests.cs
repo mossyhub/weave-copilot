@@ -19,6 +19,27 @@ public class EventMapperTests
     }
 
     [Fact]
+    public void Fusion_discards_draft_deltas_and_delivers_only_committed_answer()
+    {
+        var outs = Run(new EventMapper(), Resolved("cascade"),
+            Ev.Delta("draft", "UNREVIEWED DRAFT"), Ev.Message("draft", "UNREVIEWED DRAFT"),
+            Ev.Message("repair", "FINAL REPAIRED ANSWER", fusion: "f1:commit"),
+            Completed("cascade"), Ev.Idle());
+        var texts = outs.OfType<Update>().Where(u => u.Body.Str("sessionUpdate") == "agent_message_chunk")
+            .Select(u => u.Body["content"]!.Str("text")).ToList();
+        Assert.Equal(["FINAL REPAIRED ANSWER"], texts);
+    }
+
+    [Fact]
+    public void Cancelled_fusion_does_not_hide_the_next_plain_model_answer()
+    {
+        var outs = Run(new EventMapper(), Resolved("single"), Ev.Idle(), Ev.Delta("next", "plain answer"));
+        var texts = outs.OfType<Update>().Where(u => u.Body.Str("sessionUpdate") == "agent_message_chunk")
+            .Select(u => u.Body["content"]!.Str("text")).ToList();
+        Assert.Equal(["plain answer"], texts);
+    }
+
+    [Fact]
     public void Streamed_message_is_not_repeated_by_the_final_message()
     {
         var outs = Run(new EventMapper(),
@@ -194,6 +215,14 @@ public class EventMapperTests
         Assert.Equal("100000", call["size"]!.ToJsonString());
         Assert.Equal("23030", call["_meta"]!["call"]!["cacheWrite"]!.ToJsonString());
         Assert.Equal("88", call["_meta"]!["call"]!["reasoning"]!.ToJsonString());
+    }
+
+    [Fact]
+    public void Actual_model_is_reported_from_native_usage_for_auto_or_manual_routes()
+    {
+        var outs = Run(new EventMapper(), Ev.Make("assistant.usage", """{"model":"chosen-model","inputTokens":10,"outputTokens":2}"""));
+        var model = Assert.Single(outs.OfType<ModelChosen>());
+        Assert.Equal("chosen-model", model.Model);
     }
 
     [Fact]

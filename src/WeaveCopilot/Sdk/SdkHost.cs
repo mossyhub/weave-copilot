@@ -4,9 +4,18 @@ using GitHub.Copilot.Rpc;
 namespace WeaveCopilot.Sdk;
 
 /// <summary>The real host: runs the Copilot CLI as a child process over stdio (never in-process) and adapts the SDK to the seam.</summary>
-public sealed class SdkHost(string cliPath, bool hydraFusion) : ICopilotHost
+public sealed class SdkHost(string cliPath, bool hydraFusion, bool externalToolsOnly = false) : ICopilotHost
 {
     public string CliPath { get; } = cliPath;
+    private IReadOnlyDictionary<string, string> _fusionLevels = new Dictionary<string, string>();
+
+    public static bool TierAcknowledged(string? model, string? current, string? pending, string requested) =>
+        model == "auto" && (current == requested || pending == requested);
+
+    public static IReadOnlyDictionary<string, string> FusionLevels(AutoTierMetadata? metadata) =>
+        (metadata?.Tiers ?? []).Where(t => t.FusionTier is "standard" or "high" or "max"
+            && t.Status is { Enabled: true, PickerVisible: true })
+        .GroupBy(t => "fusion-" + t.FusionTier).ToDictionary(g => g.Key, g => g.First().Id);
 
     private readonly CopilotClient _client = new(new CopilotClientOptions
     {
@@ -52,15 +61,32 @@ public sealed class SdkHost(string cliPath, bool hydraFusion) : ICopilotHost
         var raw = new Dictionary<string, (string? Price, string? Category)>();
         try
         {
-            foreach (var m in (await _client.Rpc.Models.ListAsync()).Models)
+            var listing = await _client.Rpc.Models.ListAsync();
+            if (hydraFusion) _fusionLevels = FusionLevels(listing.Auto);
+            foreach (var m in listing.Models)
                 raw[m.Id] = (m.ModelPickerPriceCategory?.Value, m.ModelPickerCategory?.Value);
         }
         catch { }
-        return models.Select(m =>
+        if (hydraFusion && _fusionLevels.Count == 0)
+        {
+            // Some released CLIs expose V2 metadata only after a session opts into the feature.
+            var probe = new SessionConfig { Model = "auto", AvailableTools = [], EnableConfigDiscovery = false,
+                SkipCustomInstructions = true, OnPermissionRequest = (_, _) => Task.FromResult(PermissionDecision.Reject("catalog probe")) };
+            Gate(probe);
+            await using var session = await _client.CreateSessionAsync(probe);
+            _fusionLevels = FusionLevels((await session.Rpc.Model.ListAsync()).Auto);
+            var probeId = session.SessionId;
+            await session.DisposeAsync();
+            try { await _client.DeleteSessionAsync(probeId); } catch { }
+        }
+        var result = models.Select(m =>
         {
             raw.TryGetValue(m.Id, out var r);
             return new ModelEntry(m.Id, m.Name ?? m.Id, m.Billing?.Multiplier is { } x ? $"{x:0.##}x" : null, r.Price, r.Category);
         }).ToList();
+        foreach (var level in _fusionLevels.Keys)
+            result.Add(new ModelEntry(level, "Copilot Fusion " + level[7..], null));
+        return result;
     }
 
     public async Task<AuthStatus> AuthStatusAsync()
@@ -78,7 +104,8 @@ public sealed class SdkHost(string cliPath, bool hydraFusion) : ICopilotHost
         Gate(config);
         Discover(config, skillDirectories);
         config.McpServers = ToSdk(mcp);
-        return new SdkSession(await _client.CreateSessionAsync(config));
+        ApplyExternalToolBoundary(config, externalToolsOnly);
+        return new SdkSession(await _client.CreateSessionAsync(config), _fusionLevels);
     }
 
     public async Task<ICopilotSession> ResumeAsync(string sessionId, string cwd, PermissionCallback permission, IReadOnlyList<AcpMcpServer>? mcp = null, IReadOnlyList<string>? skillDirectories = null)
@@ -87,7 +114,19 @@ public sealed class SdkHost(string cliPath, bool hydraFusion) : ICopilotHost
         Gate(config);
         Discover(config, skillDirectories);
         config.McpServers = ToSdk(mcp);
-        return new SdkSession(await _client.ResumeSessionAsync(sessionId, config));
+        ApplyExternalToolBoundary(config, externalToolsOnly);
+        return new SdkSession(await _client.ResumeSessionAsync(sessionId, config), _fusionLevels);
+    }
+
+    /// <summary>Hermes owns tools, approvals and instructions; do not create a second ambient executor.</summary>
+    public static void ApplyExternalToolBoundary(SessionConfigBase config, bool enabled)
+    {
+        if (!enabled) return;
+        config.AvailableTools = [];
+        config.EnableConfigDiscovery = false;
+        config.SkipCustomInstructions = true;
+        config.McpServers = null;
+        config.SkillDirectories = [];
     }
 
     /// <summary>Without discovery a session doesn't see the folder's .github/agents and .github/skills.</summary>
@@ -114,7 +153,8 @@ public sealed class SdkHost(string cliPath, bool hydraFusion) : ICopilotHost
     {
         if (!hydraFusion) return;
         config.EnableExperimentalMode = true;
-        config.FeatureFlags = new Dictionary<string, bool> { ["HYDRAFUSION_ROLLOUT"] = true };
+        config.FeatureFlags = new Dictionary<string, bool> { ["HYDRAFUSION_ROLLOUT"] = true,
+            ["DYNAMIC_AUTO_TIERS"] = true, ["HYDRAFUSION_PLAN_V2"] = true };
     }
 
     public async Task<string> ForkAsync(string sessionId, string? toEventId) => (await _client.Rpc.Sessions.ForkAsync(sessionId, toEventId, null)).SessionId;
@@ -136,8 +176,9 @@ public sealed class SdkHost(string cliPath, bool hydraFusion) : ICopilotHost
 
     public async ValueTask DisposeAsync() { try { await _client.StopAsync(); } catch { } await _client.DisposeAsync(); RestoreSettings(); }
 
-    private sealed class SdkSession(CopilotSession s) : ICopilotSession
+    private sealed class SdkSession(CopilotSession s, IReadOnlyDictionary<string, string> levels) : ICopilotSession
     {
+        private string? _requestedTier;
         public string Id => s.SessionId;
         public IDisposable Subscribe(Action<SessionEvent> handler) => s.On(handler);
         public Task SendAsync(string prompt, bool immediate, IReadOnlyList<ImageData>? images = null, string? displayPrompt = null) =>
@@ -167,7 +208,30 @@ public sealed class SdkHost(string cliPath, bool hydraFusion) : ICopilotHost
         };
         public Task SelectAgentAsync(string? name) => string.IsNullOrEmpty(name) ? s.Rpc.Agent.DeselectAsync() : s.Rpc.Agent.SelectAsync(name);
         public Task AbortAsync() => s.AbortAsync();
-        public Task SetModelAsync(string modelId) => s.SetModelAsync(modelId);
+        public async Task SetModelAsync(string modelId)
+        {
+            if (!levels.TryGetValue(modelId, out var tier))
+            {
+                if (modelId.StartsWith("fusion-", StringComparison.Ordinal))
+                    throw new InvalidOperationException("Requested Fusion tier is not enabled by this account.");
+                await s.SetModelAsync(modelId);
+                _requestedTier = null;
+                return;
+            }
+            await s.SetModelAsync("auto");
+            var switched = await s.SetAutoTierAsync(new AutoTier(tier));
+            var current = await s.Rpc.Model.GetCurrentAsync();
+            if (!TierAcknowledged(current.ModelId, current.AutoTier?.Value, current.PendingAutoTier?.Value, tier))
+                throw new InvalidOperationException($"Copilot tier acknowledgement differs: requested={tier}, model={current.ModelId}, current={current.AutoTier?.Value}, pending={current.PendingAutoTier?.Value}, effective={switched.EffectiveAutoTier?.Value}, status={switched.Status.Value}");
+            _requestedTier = tier;
+        }
+        public async Task VerifyModelSelectionAsync()
+        {
+            if (_requestedTier is null) return;
+            var current = await s.Rpc.Model.GetCurrentAsync();
+            if (current.ModelId != "auto" || current.AutoTier?.Value != _requestedTier)
+                throw new InvalidOperationException("Copilot did not commit the requested Fusion tier for this turn.");
+        }
         public async Task<IReadOnlyList<SessionEvent>> GetEventsAsync() => await s.GetEventsAsync();
         public async Task<string?> AskAsync(string question) => (await s.Rpc.Ui.EphemeralQueryAsync(question)).Answer;
         public async Task<ShellResult> RunShellAsync(string requestId, string command)

@@ -9,6 +9,8 @@ public abstract record AgentOutput;
 public sealed record Update(JsonObject Body) : AgentOutput;
 /// <summary>Params (minus sessionId) of the `_fleet/fusion` notification.</summary>
 public sealed record Fusion(JsonObject Params) : AgentOutput;
+/// <summary>Concrete model reported by a root native call, distinct from the requested route.</summary>
+public sealed record ModelChosen(string Model) : AgentOutput;
 /// <summary>Params (minus sessionId) of the `_fleet/compaction` notification.</summary>
 public sealed record Compaction(JsonObject Params) : AgentOutput;
 /// <summary>The session went idle: the running prompt is over.</summary>
@@ -44,6 +46,7 @@ public sealed class EventMapper(string? cwd = null, bool history = false)
     private long _nanoAiu;                                       // credits the turn's own calls reported, in nano-AIU
     private Fusion? _heldResolved;                           // history: the CLI logs `resolved` before the user's message, so it waits for the turn's first pass
     private FusionTotals? _fusion;                               // the turn's authoritative totals, once fusion_completed arrived
+    private bool _fusionActive;                                 // draft text is not the committed user-facing answer
 
     /// <summary>The subagents and background shells this session started.</summary>
     public BackgroundWork Background { get; } = new();
@@ -89,6 +92,8 @@ public sealed class EventMapper(string? cwd = null, bool history = false)
         // was already emitted: with streaming on, an answer can reach us only on the commit copy.
         if (!history && CommitId(ev) is not null && IsLiveTwinSeen(ev)) yield break;
         if (!history && CommitId(ev) is not null && ev is AssistantUsageEvent) yield break;
+        if (!history && _fusionActive &&
+            (ev is AssistantMessageDeltaEvent || ev is AssistantMessageEvent && CommitId(ev) is null)) yield break;
 
         switch (ev)
         {
@@ -147,6 +152,8 @@ public sealed class EventMapper(string? cwd = null, bool history = false)
                 _nanoAiu += (long)(au.Data.CopilotUsage?.TotalNanoAiu ?? 0);
                 // The main agent's own call (not a subagent's): its tokens, as the CLI counts them (input with the cached ones).
                 if (ev.AgentId is null && au.Data.ParentToolCallId is null)
+                {
+                    if (!string.IsNullOrWhiteSpace(au.Data.Model)) yield return new ModelChosen(au.Data.Model);
                     yield return new Update(new JsonObject
                     {
                         ["sessionUpdate"] = "usage_update", ["used"] = (au.Data.InputTokens ?? 0) + (au.Data.OutputTokens ?? 0), ["size"] = _size,
@@ -156,6 +163,7 @@ public sealed class EventMapper(string? cwd = null, bool history = false)
                             ["output"] = au.Data.OutputTokens ?? 0, ["reasoning"] = au.Data.ReasoningTokens ?? 0,
                         } },
                     });
+                }
                 break;
             case SessionErrorEvent e when !history:
                 yield return new Failure(e.Data.Message ?? e.Data.ErrorType ?? "Copilot reported an error");
@@ -164,6 +172,7 @@ public sealed class EventMapper(string? cwd = null, bool history = false)
                 yield return new Failure(rf.Data.ErrorMessage ?? rf.Data.Reason ?? "fusion routing failed");
                 break;
             case SessionIdleEvent idle when !history:
+                _fusionActive = false;
                 yield return new Idle(idle.Data.Aborted == true, TakeUsage());
                 break;
             case SessionCompactionStartEvent cs:
@@ -179,6 +188,7 @@ public sealed class EventMapper(string? cwd = null, bool history = false)
                     cd.Success ? null : cd.Error ?? cd.FailureReason ?? "Copilot couldn't compact the session");
                 break;
             case SessionFusionResolvedEvent fr:
+                if (!history) _fusionActive = true;
                 var resolved = new Fusion(new JsonObject
                 {
                     ["event"] = "resolved", ["pattern"] = fr.Data.Pattern.Value, ["model"] = fr.Data.PrimaryModel, ["secondaryModel"] = fr.Data.SecondaryModel,
@@ -216,6 +226,7 @@ public sealed class EventMapper(string? cwd = null, bool history = false)
                 });
                 break;
             case SessionFusionCompletedEvent fc:
+                _fusionActive = false;
                 if (TakeHeld() is { } h3) yield return h3;
                 if (!history)
                     _fusion = new FusionTotals(fc.Data.InputTokens, fc.Data.OutputTokens, fc.Data.CachedTokens, fc.Data.CacheWriteTokens ?? 0, fc.Data.RequestCount, fc.Data.TotalNanoAiu);

@@ -4,12 +4,14 @@ using WeaveCopilot.Sdk;
 
 string? cliArg = null;
 var hydra = false;
+var externalToolsOnly = false;
 for (var i = 0; i < args.Length; i++)
 {
     switch (args[i])
     {
         case "--copilot-cli" when i + 1 < args.Length: cliArg = args[++i]; break;
         case "--hydrafusion": hydra = true; break;
+        case "--hermes-tools-only": externalToolsOnly = true; break;
         case "--version": Console.WriteLine("weave-copilot " + Version()); return 0;
         default: Console.Error.WriteLine($"weave-copilot: unknown argument '{args[i]}'\nusage: weave-copilot [--copilot-cli <path>] [--hydrafusion]"); return 2; }
 }
@@ -17,7 +19,7 @@ for (var i = 0; i < args.Length; i++)
 static string Version() => typeof(AcpAgent).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.0.0";
 
 SdkHost host;
-try { host = new SdkHost(SdkHost.ResolveCli(cliArg), hydra); }
+try { host = new SdkHost(SdkHost.ResolveCli(cliArg), hydra, externalToolsOnly); }
 catch (Exception e) { Console.Error.WriteLine("weave-copilot: " + e.Message); return 1; }
 
 // stdout carries only protocol lines; everything else goes to stderr.

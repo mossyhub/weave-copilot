@@ -71,6 +71,7 @@ public interface ICopilotSession : IAsyncDisposable
     Task SelectAgentAsync(string? name);
     Task AbortAsync();
     Task SetModelAsync(string modelId);
+    Task VerifyModelSelectionAsync() => Task.CompletedTask;
     Task<IReadOnlyList<SessionEvent>> GetEventsAsync();
     /// <summary>An off-the-record question: the model sees the whole conversation, and nothing is added to it. Null when there is no answer.</summary>
     Task<string?> AskAsync(string question);

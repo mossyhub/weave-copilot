@@ -84,7 +84,8 @@ public class AgentTests
         Assert.Equal("end_turn", res.Str("stopReason"));
         Assert.Equal(12, res["usage"]!["totalTokens"]!.GetValue<long>());
         Assert.Equal("say hi", host.Session.Sent.Single().Prompt);
-        Assert.Equal(["agent_message_chunk", "usage_update"], wire.Notifications.Select(n => n["params"]!["update"]!.Str("sessionUpdate")));
+        Assert.Equal(["agent_message_chunk", "usage_update"], wire.Notifications.Where(n => n.Str("method") == "session/update").Select(n => n["params"]!["update"]!.Str("sessionUpdate")));
+        Assert.Equal("m", Assert.Single(wire.Notifications, n => n.Str("method") == "_fleet/model")["params"]!.Str("model"));
         await wire.CloseAsync();
     }
 
