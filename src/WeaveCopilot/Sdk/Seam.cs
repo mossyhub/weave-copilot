@@ -56,6 +56,7 @@ public sealed record AcpMcpServer(string Name, string Url, IReadOnlyDictionary<s
 public interface ICopilotSession : IAsyncDisposable
 {
     string Id { get; }
+    IReadOnlyList<NativeToolIntent> NativeIntents => [];
     IDisposable Subscribe(Action<SessionEvent> handler);
     /// <summary>Sends a prompt; <paramref name="displayPrompt"/> is what the transcript shows when the model is sent more than the user typed.</summary>
     Task SendAsync(string prompt, bool immediate, IReadOnlyList<ImageData>? images = null, string? displayPrompt = null);
@@ -86,6 +87,7 @@ public interface ICopilotSession : IAsyncDisposable
 /// <summary>Small seam around the Copilot client (one CLI child process).</summary>
 public interface ICopilotHost : IAsyncDisposable
 {
+    bool SupportsHermesToolIntents => false;
     Task StartAsync();
     Task<string?> VersionAsync();
     /// <summary>Throws if the CLI child process is gone.</summary>
@@ -93,7 +95,7 @@ public interface ICopilotHost : IAsyncDisposable
     Task<IReadOnlyList<ModelEntry>> ListModelsAsync();
     /// <summary>Who the CLI is signed in as, asked of the CLI so it reflects a sign-in made a moment ago.</summary>
     Task<AuthStatus> AuthStatusAsync();
-    Task<ICopilotSession> CreateAsync(string cwd, string? model, PermissionCallback permission, IReadOnlyList<AcpMcpServer>? mcp = null, IReadOnlyList<string>? skillDirectories = null);
+    Task<ICopilotSession> CreateAsync(string cwd, string? model, PermissionCallback permission, IReadOnlyList<AcpMcpServer>? mcp = null, IReadOnlyList<string>? skillDirectories = null, IReadOnlyList<System.Text.Json.JsonElement>? schemas = null);
     Task<ICopilotSession> ResumeAsync(string sessionId, string cwd, PermissionCallback permission, IReadOnlyList<AcpMcpServer>? mcp = null, IReadOnlyList<string>? skillDirectories = null);
     /// <summary>Custom agents Copilot finds for a folder, without a session.</summary>
     Task<IReadOnlyList<AgentEntry>> ListAgentsAsync(string cwd);

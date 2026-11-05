@@ -6,6 +6,7 @@ namespace WeaveCopilot.Sdk;
 /// <summary>The real host: runs the Copilot CLI as a child process over stdio (never in-process) and adapts the SDK to the seam.</summary>
 public sealed class SdkHost(string cliPath, bool hydraFusion, bool externalToolsOnly = false) : ICopilotHost
 {
+    public bool SupportsHermesToolIntents => externalToolsOnly;
     public string CliPath { get; } = cliPath;
     private IReadOnlyDictionary<string, string> _fusionLevels = new Dictionary<string, string>();
 
@@ -98,14 +99,16 @@ public sealed class SdkHost(string cliPath, bool hydraFusion, bool externalTools
     private Func<PermissionRequest, PermissionInvocation, Task<PermissionDecision>> Wrap(PermissionCallback cb) =>
         (req, inv) => cb(inv.SessionId, req);
 
-    public async Task<ICopilotSession> CreateAsync(string cwd, string? model, PermissionCallback permission, IReadOnlyList<AcpMcpServer>? mcp = null, IReadOnlyList<string>? skillDirectories = null)
+    public async Task<ICopilotSession> CreateAsync(string cwd, string? model, PermissionCallback permission, IReadOnlyList<AcpMcpServer>? mcp = null, IReadOnlyList<string>? skillDirectories = null, IReadOnlyList<System.Text.Json.JsonElement>? schemas = null)
     {
+        if (!externalToolsOnly && schemas is not null) throw new ArgumentException("Native Hermes schemas require --hermes-tools-only");
+        var intents = externalToolsOnly ? new NativeToolIntents(schemas ?? []) : null;
         var config = new SessionConfig { Model = model, WorkingDirectory = cwd, Streaming = true, OnPermissionRequest = Wrap(permission) };
         Gate(config);
         Discover(config, skillDirectories);
         config.McpServers = ToSdk(mcp);
-        ApplyExternalToolBoundary(config, externalToolsOnly);
-        return new SdkSession(await _client.CreateSessionAsync(config), _fusionLevels);
+        ApplyExternalToolBoundary(config, externalToolsOnly, intents);
+        return new SdkSession(await _client.CreateSessionAsync(config), _fusionLevels, intents);
     }
 
     public async Task<ICopilotSession> ResumeAsync(string sessionId, string cwd, PermissionCallback permission, IReadOnlyList<AcpMcpServer>? mcp = null, IReadOnlyList<string>? skillDirectories = null)
@@ -119,10 +122,15 @@ public sealed class SdkHost(string cliPath, bool hydraFusion, bool externalTools
     }
 
     /// <summary>Hermes owns tools, approvals and instructions; do not create a second ambient executor.</summary>
-    public static void ApplyExternalToolBoundary(SessionConfigBase config, bool enabled)
+    public static void ApplyExternalToolBoundary(SessionConfigBase config, bool enabled, NativeToolIntents? intents = null)
     {
         if (!enabled) return;
-        config.AvailableTools = [];
+        config.Tools = intents is null ? [] : [.. intents.Functions];
+        config.AvailableTools = config.Tools.Select(t => t.Name).ToList();
+        config.OnPermissionRequest = (_, _) => Task.FromResult(PermissionDecision.Reject("Hermes owns execution; native permission denied"));
+        config.EnableSkills = false;
+        config.EnableHostGitOperations = false;
+        config.EnableFileHooks = false;
         config.EnableConfigDiscovery = false;
         config.SkipCustomInstructions = true;
         config.McpServers = null;
@@ -176,19 +184,23 @@ public sealed class SdkHost(string cliPath, bool hydraFusion, bool externalTools
 
     public async ValueTask DisposeAsync() { try { await _client.StopAsync(); } catch { } await _client.DisposeAsync(); RestoreSettings(); }
 
-    private sealed class SdkSession(CopilotSession s, IReadOnlyDictionary<string, string> levels) : ICopilotSession
+    private sealed class SdkSession(CopilotSession s, IReadOnlyDictionary<string, string> levels, NativeToolIntents? intents = null) : ICopilotSession
     {
         private string? _requestedTier;
         public string Id => s.SessionId;
+        public IReadOnlyList<NativeToolIntent> NativeIntents => intents?.Snapshot() ?? [];
         public IDisposable Subscribe(Action<SessionEvent> handler) => s.On(handler);
-        public Task SendAsync(string prompt, bool immediate, IReadOnlyList<ImageData>? images = null, string? displayPrompt = null) =>
-            s.SendAsync(new MessageOptions
+        public Task SendAsync(string prompt, bool immediate, IReadOnlyList<ImageData>? images = null, string? displayPrompt = null)
+        {
+            if (!immediate) intents?.BeginPrompt();
+            return s.SendAsync(new MessageOptions
             {
                 Prompt = prompt,
                 DisplayPrompt = displayPrompt,
                 Mode = immediate ? "immediate" : null,
                 Attachments = images is { Count: > 0 } ? [.. images.Select(i => (Attachment)new AttachmentBlob { Data = i.Base64, MimeType = i.MimeType, DisplayName = i.Name })] : null,
             });
+        }
         public async Task<IReadOnlyList<TodoRow>> ReadTodosAsync() =>
             (await s.Rpc.Plan.ReadSqlTodosAsync()).Rows.Select(r => new TodoRow(r.Title ?? r.Description ?? r.Id ?? "", r.Status ?? "pending")).ToList();
         public async Task<CompactResult> CompactAsync(string? instructions)
@@ -207,7 +219,7 @@ public sealed class SdkHost(string cliPath, bool hydraFusion, bool externalTools
             _ => new CommandResult("unsupported", null),
         };
         public Task SelectAgentAsync(string? name) => string.IsNullOrEmpty(name) ? s.Rpc.Agent.DeselectAsync() : s.Rpc.Agent.SelectAsync(name);
-        public Task AbortAsync() => s.AbortAsync();
+        public Task AbortAsync() { intents?.CancelPrompt(); return s.AbortAsync(); }
         public async Task SetModelAsync(string modelId)
         {
             if (!levels.TryGetValue(modelId, out var tier))

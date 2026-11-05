@@ -96,6 +96,11 @@ public sealed class FakeSession(string id) : ICopilotSession
 {
     private Action<SessionEvent>? _handler;
     public string Id { get; } = id;
+    public NativeToolIntents? IntentRecorder { get; set; }
+    public IReadOnlyList<NativeToolIntent> NativeIntents => IntentRecorder?.Snapshot() ?? [];
+    public int ModelVerifications { get; private set; }
+    public bool TierMismatch { get; set; }
+    public Task VerifyModelSelectionAsync() { ModelVerifications++; if (TierMismatch) throw new InvalidOperationException("tier mismatch"); return Task.CompletedTask; }
     public List<(string Prompt, bool Immediate)> Sent { get; } = [];
     public List<string?> DisplayPrompts { get; } = [];
     public CompactResult CompactOutcome { get; set; } = new(true, 1200, 14);
@@ -110,7 +115,7 @@ public sealed class FakeSession(string id) : ICopilotSession
 
     public void Raise(params SessionEvent[] events) { foreach (var e in events) _handler?.Invoke(e); }
     public IDisposable Subscribe(Action<SessionEvent> handler) { _handler = handler; return new Noop(); }
-    public Task SendAsync(string prompt, bool immediate, IReadOnlyList<ImageData>? images = null, string? displayPrompt = null) { Sent.Add((prompt, immediate)); DisplayPrompts.Add(displayPrompt); Images.AddRange(images ?? []); OnSend?.Invoke(this, prompt); return Task.CompletedTask; }
+    public Task SendAsync(string prompt, bool immediate, IReadOnlyList<ImageData>? images = null, string? displayPrompt = null) { if (!immediate) IntentRecorder?.BeginPrompt(); Sent.Add((prompt, immediate)); DisplayPrompts.Add(displayPrompt); Images.AddRange(images ?? []); OnSend?.Invoke(this, prompt); return Task.CompletedTask; }
     public Task<IReadOnlyList<TodoRow>> ReadTodosAsync() => Task.FromResult<IReadOnlyList<TodoRow>>([.. Todos]);
     public Task<CompactResult> CompactAsync(string? instructions) { Compactions.Add(instructions); return Task.FromResult(CompactOutcome); }
     public List<CommandEntry> Commands { get; } = [];
@@ -120,7 +125,7 @@ public sealed class FakeSession(string id) : ICopilotSession
     public Task<IReadOnlyList<CommandEntry>> ListCommandsAsync() => Task.FromResult<IReadOnlyList<CommandEntry>>([.. Commands]);
     public Task<CommandResult> InvokeCommandAsync(string name, string? input) { Invoked.Add((name, input)); return Task.FromResult(Results[name]); }
     public Task SelectAgentAsync(string? name) { Agents.Add(name); return Task.CompletedTask; }
-    public Task AbortAsync() { Aborted = true; Raise(Ev.Idle(aborted: true)); return Task.CompletedTask; }
+    public Task AbortAsync() { Aborted = true; IntentRecorder?.CancelPrompt(); Raise(Ev.Idle(aborted: true)); return Task.CompletedTask; }
     public Task SetModelAsync(string modelId) { Models.Add(modelId); return Task.CompletedTask; }
     public Task<IReadOnlyList<SessionEvent>> GetEventsAsync() => Task.FromResult<IReadOnlyList<SessionEvent>>(History);
     public List<string> Asked { get; } = [];
@@ -141,6 +146,7 @@ public sealed class FakeSession(string id) : ICopilotSession
 
 public sealed class FakeHost : ICopilotHost
 {
+    public bool SupportsHermesToolIntents { get; set; }
     public FakeSession Session { get; } = new("s-1");
     public List<ModelEntry> Models { get; } = [new("auto", "Auto", "0x"), new("other", "Other", "1x", "low", "lightweight")];
     public bool HydraProbeResult { get; set; } = true;
@@ -155,11 +161,12 @@ public sealed class FakeHost : ICopilotHost
     public AuthStatus Auth { get; set; } = new(true, "user", "https://github.com", "octo-demo", null);
     public Task<AuthStatus> AuthStatusAsync() => Task.FromResult(Auth);
     public Task<IReadOnlyList<ModelEntry>> ListModelsAsync() => Task.FromResult<IReadOnlyList<ModelEntry>>(Models);
+    public IReadOnlyList<System.Text.Json.JsonElement>? Schemas;
     public IReadOnlyList<AcpMcpServer>? Mcp;
     public List<IReadOnlyList<string>?> SkillDirs { get; } = [];
     public List<AgentEntry> AgentList { get; } = [];
     public Task<IReadOnlyList<AgentEntry>> ListAgentsAsync(string cwd) => Task.FromResult<IReadOnlyList<AgentEntry>>([.. AgentList]);
-    public Task<ICopilotSession> CreateAsync(string cwd, string? model, PermissionCallback permission, IReadOnlyList<AcpMcpServer>? mcp = null, IReadOnlyList<string>? skillDirectories = null) { Mcp = mcp; SkillDirs.Add(skillDirectories); Creates++; CreatedModel = model; Permission = permission; return Task.FromResult<ICopilotSession>(Session); }
+    public Task<ICopilotSession> CreateAsync(string cwd, string? model, PermissionCallback permission, IReadOnlyList<AcpMcpServer>? mcp = null, IReadOnlyList<string>? skillDirectories = null, IReadOnlyList<System.Text.Json.JsonElement>? schemas = null) { Schemas = schemas; Mcp = mcp; SkillDirs.Add(skillDirectories); Creates++; CreatedModel = model; Permission = permission; return Task.FromResult<ICopilotSession>(Session); }
     public Task<ICopilotSession> ResumeAsync(string sessionId, string cwd, PermissionCallback permission, IReadOnlyList<AcpMcpServer>? mcp = null, IReadOnlyList<string>? skillDirectories = null) { Mcp = mcp; SkillDirs.Add(skillDirectories); Permission = permission; return Task.FromResult<ICopilotSession>(Session); }
     public List<(string SessionId, string? ToEventId)> Forks { get; } = [];
     public Task<string> ForkAsync(string sessionId, string? toEventId) { Forks.Add((sessionId, toEventId)); return Task.FromResult("fork-1"); }

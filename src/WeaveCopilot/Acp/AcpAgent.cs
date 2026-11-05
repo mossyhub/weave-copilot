@@ -44,6 +44,9 @@ public sealed class AcpAgent(JsonRpcConnection rpc, ICopilotHost host, bool hydr
     {
         try
         {
+            if (method != "session/new" && p is JsonObject parameters && parameters["_meta"] is JsonObject meta
+                && meta.Any(kv => kv.Key.StartsWith("hermesTool", StringComparison.Ordinal)))
+                throw new JsonRpcException(-32602, "Hermes tool schemas are supported only on session/new");
             return method switch
             {
                 "initialize" => await InitializeAsync(),
@@ -148,17 +151,29 @@ public sealed class AcpAgent(JsonRpcConnection rpc, ICopilotHost host, bool hydr
                 ["promptCapabilities"] = new JsonObject { ["image"] = true, ["embeddedContext"] = true },
             },
             ["agentInfo"] = new JsonObject { ["name"] = "weave-copilot", ["version"] = version },
-            ["_meta"] = new JsonObject { ["cliVersion"] = cli },
+            ["_meta"] = InitializeMeta(cli),
         };
+    }
+
+    private JsonObject InitializeMeta(string? cli)
+    {
+        var meta = new JsonObject { ["cliVersion"] = cli };
+        if (host.SupportsHermesToolIntents) meta["hermesToolIntentVersion"] = 1;
+        return meta;
     }
 
     private async Task<JsonNode?> NewAsync(JsonNode? p)
     {
+        IReadOnlyList<System.Text.Json.JsonElement>? schemas;
+        try { schemas = HermesToolSchemas.Parse(p?["_meta"], host.SupportsHermesToolIntents); }
+        catch (ArgumentException e) { throw new JsonRpcException(-32602, e.Message); }
         var cwd = p.Str("cwd") ?? Directory.GetCurrentDirectory();
         var models = await ModelsAsync(cwd);
         var model = DefaultFor(models);
-        var s = await Register(await host.CreateAsync(cwd, model, Permission, AcpMcpServer.Parse(p?["mcpServers"]), SkillDirectories(p)), cwd, model);
-        return new JsonObject { ["sessionId"] = s.Session.Id, ["models"] = ModelsJson(models, s.Model) };
+        var s = await Register(await host.CreateAsync(cwd, model, Permission, AcpMcpServer.Parse(p?["mcpServers"]), SkillDirectories(p), schemas), cwd, model);
+        var result = new JsonObject { ["sessionId"] = s.Session.Id, ["models"] = ModelsJson(models, s.Model) };
+        if (schemas is not null) result["_meta"] = new JsonObject { ["hermesToolIntentVersion"] = 1 };
+        return result;
     }
 
     /// <summary>Auto when the account lists it, else the first model listed; null only when there are none.</summary>
@@ -184,6 +199,7 @@ public sealed class AcpAgent(JsonRpcConnection rpc, ICopilotHost host, bool hydr
     /// <summary>A name selects that custom agent for later turns; empty or null goes back to Copilot's own.</summary>
     private async Task<JsonNode?> SetAgentAsync(JsonNode? p)
     {
+        if (host.SupportsHermesToolIntents) throw new JsonRpcException(-32602, "Native agents are disabled in Hermes mode");
         await Find(p).Session.SelectAgentAsync(p.Str("value"));
         return new JsonObject();
     }
@@ -219,6 +235,7 @@ public sealed class AcpAgent(JsonRpcConnection rpc, ICopilotHost host, bool hydr
             var past = new EventMapper(cwd, history: true);
             foreach (var ev in await session.GetEventsAsync())
             {
+                if (host.SupportsHermesToolIntents && ev is ToolExecutionStartEvent or ToolExecutionCompleteEvent) continue;
                 if (ev is SessionStartEvent { Data.SelectedModel: { } sel }) s.Model = sel;
                 foreach (var o in past.Map(ev)) Emit(session.Id, o, s);
             }
@@ -226,6 +243,8 @@ public sealed class AcpAgent(JsonRpcConnection rpc, ICopilotHost host, bool hydr
         s.Subscription = session.Subscribe(ev =>
         {
             if (ev is UserMessageEvent um && s.Turn is not null && s.TurnUserEventId is null) s.TurnUserEventId = um.Id.ToString();
+            // A successful recording callback is NOT a successful Hermes action. Never project SDK tool progress.
+            if (host.SupportsHermesToolIntents && ev is ToolExecutionStartEvent or ToolExecutionCompleteEvent) return;
             foreach (var o in s.Mapper.Map(ev)) Emit(session.Id, o, s);
         });
         return s;
@@ -297,14 +316,14 @@ public sealed class AcpAgent(JsonRpcConnection rpc, ICopilotHost host, bool hydr
         {
             var parts = new List<string>(notes);
             string? display = null;
-            if (text.StartsWith('/') && await SlashAsync(s, text) is { } slash)
+            if (!host.SupportsHermesToolIntents && text.StartsWith('/') && await SlashAsync(s, text) is { } slash)
             {
                 if (slash.Kind != "prompt") return Reply(s, slash);
                 (parts, display) = ([.. parts, slash.Text ?? text], text);
             }
             else
             {
-                parts.AddRange(await SkillPromptsAsync(s, Strings(p?["_meta"]?["skills"])));
+                if (!host.SupportsHermesToolIntents) parts.AddRange(await SkillPromptsAsync(s, Strings(p?["_meta"]?["skills"])));
                 parts.Add(text);
                 if (parts.Count > 1) display = text;
             }
@@ -315,6 +334,9 @@ public sealed class AcpAgent(JsonRpcConnection rpc, ICopilotHost host, bool hydr
             var idle = (Idle)end;
             if (!idle.Aborted && !s.CancelRequested) await s.Session.VerifyModelSelectionAsync();
             var result = new JsonObject { ["stopReason"] = idle.Aborted || s.CancelRequested ? "cancelled" : "end_turn" };
+            if (host.SupportsHermesToolIntents)
+                result["_meta"] = new JsonObject { ["hermesToolIntentVersion"] = 1,
+                    ["hermesToolCalls"] = new JsonArray((idle.Aborted || s.CancelRequested ? [] : s.Session.NativeIntents).Select(c => (JsonNode)c.ToJson()).ToArray()) };
             if (idle.Usage is not null) result["usage"] = idle.Usage;
             return result;
         }
@@ -388,6 +410,7 @@ public sealed class AcpAgent(JsonRpcConnection rpc, ICopilotHost host, bool hydr
     /// <summary>A `!` command. Refused while a prompt runs (the CLI would interleave it with the turn); the output reaches the model on the next turn.</summary>
     private async Task<JsonNode?> ShellAsync(JsonNode? p)
     {
+        if (host.SupportsHermesToolIntents) throw new JsonRpcException(-32602, "Only outer Hermes may execute shell commands");
         var s = Find(p);
         if (s.Turn is not null) throw new JsonRpcException(-32001, "A turn is running; run the command when it's over");
         var command = p.Str("command") ?? throw new JsonRpcException(-32602, "command is required");
